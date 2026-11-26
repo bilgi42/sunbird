@@ -422,7 +422,12 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          );
       },
       Machine::Aarch64 if macho && image.file_name() == macos::EXECUTABLE => {
-         report("access gate", macos::access_gate(image).map(at));
+         let read = macos::access_gate(image);
+         report("access gate", read.clone().map(at));
+         report(
+            "access enforced",
+            read.and_then(|read| macos::access_enforced(image, read).map(at)),
+         );
       },
       Machine::Aarch64 if macho => {
          report(
