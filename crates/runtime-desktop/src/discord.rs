@@ -273,12 +273,17 @@ impl RawPollResult {
    }
 }
 
-// `send` and `poll` are Rust-ABI trait methods, declared Rust ABI here so the
-// same lowering applies on Win64 and SysV: `send` returns its pointer pair
-// (`Pin<Box<dyn Future>>`) in RAX:RDX, and `poll` returns the 128-byte
-// `RawPollResult` through a hidden sret pointer in the first argument register.
+// `send` is declared Rust ABI so it lowers like the host's trait method on
+// Win64 and SysV, returning `Pin<Box<dyn Future>>` in RAX:RDX. `poll` returns
+// its result through an sret pointer in the first argument register and hands
+// it back in RAX, which `extern "C"` with the pointer spelled out matches.
+// Taking the buffer explicitly lets the detour forward the caller's own: the
+// original writes as much of its result as its build's layout needs, which can
+// exceed the `RawPollResult` the runtime reads, and a local of that size would
+// overflow.
 type SendFn = unsafe fn(*const c_void, *mut c_void) -> RawPinnedFuture;
-type PollFn = unsafe fn(*mut c_void, *mut c_void) -> RawPollResult;
+type PollFn =
+   unsafe extern "C" fn(*mut RawPollResult, *mut c_void, *mut c_void) -> *mut RawPollResult;
 type HostAllocFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
 type HostDeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
 
@@ -461,7 +466,7 @@ pub fn install(image: &Image<'static>) {
       .map(|&slot| (slot, poll_detour as *const () as usize))
       .collect::<Vec<_>>();
    // SAFETY: every poll slot is an aligned `.rdata` vtable entry pointing to
-   // `poll_fn`, and `poll_detour` matches its Rust ABI.
+   // `poll_fn`, and `poll_detour` matches its sret lowering.
    match unsafe { image.swap_words(&polls) } {
       Ok(_) => {
          log::info!(
@@ -633,15 +638,21 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
    future
 }
 
-unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
+unsafe extern "C" fn poll_detour(
+   out: *mut RawPollResult,
+   future: *mut c_void,
+   cx: *mut c_void,
+) -> *mut RawPollResult {
    let installed = INSTALLED
       .get()
       .expect("poll_detour only runs after INSTALLED is set");
-   // SAFETY: forward to original `SendFuture::poll`.
-   let mut result = unsafe { (installed.poll)(future, cx) };
+   // SAFETY: forward to original `SendFuture::poll` with the caller's buffer.
+   unsafe { (installed.poll)(out, future, cx) };
+   // SAFETY: the original filled `out`, which the caller owns for this call.
+   let result = unsafe { &mut *out };
 
    if result.is_pending() {
-      return result;
+      return out;
    }
 
    if let Some(in_flight) = take_response(future.addr() as u64)
@@ -669,7 +680,7 @@ unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
       log::error!("discord desktop: poll_detour panicked");
    }
 
-   result
+   out
 }
 
 /// Replaces `vec`'s contents with `new_body` while staying 100% compatible
