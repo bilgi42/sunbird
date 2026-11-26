@@ -1,6 +1,6 @@
 //! `libphoenix.so` / `phoenix.dll`, injected through `DT_NEEDED` on Android,
-//! as a dylib on iOS, or loaded into Desktop Phoenix on Windows and, through
-//! `LD_PRELOAD`, on Linux.
+//! as a dylib on iOS, or loaded into Desktop Phoenix on Windows, through
+//! `LD_PRELOAD` on Linux and through `DYLD_INSERT_LIBRARIES` on macOS.
 //!
 //! On Unix the constructor runs once the host library is mapped and relocated.
 //! Desktop hooks Discord synchronously, from `DllMain` or the constructor, then
@@ -8,20 +8,23 @@
 //! come from the bundle stored beside this library (when present) plus
 //! `$PHOENIX_HOME/plugins`.
 
+#[cfg(any(test, not(target_os = "macos")))]
+use std::path::PathBuf;
+#[cfg(not(target_os = "macos"))]
 use std::{
    env,
    panic::{
       self,
       AssertUnwindSafe,
    },
-   path::PathBuf,
 };
 
+use phoenix_runtime::console::Tee;
+#[cfg(not(target_os = "macos"))]
 use phoenix_runtime::{
    Error,
    Plugin,
    Started,
-   console::Tee,
 };
 
 #[cfg(unix)]
@@ -69,7 +72,16 @@ extern "C" fn init() {
       logging();
       ios::start_with_phoenix();
    }
-   #[cfg(not(any(target_os = "ios", all(target_os = "linux", target_arch = "x86_64"))))]
+   #[cfg(target_os = "macos")]
+   {
+      logging();
+      macos::open_access_gate();
+   }
+   #[cfg(not(any(
+      target_os = "ios",
+      target_os = "macos",
+      all(target_os = "linux", target_arch = "x86_64")
+   )))]
    {
       logging();
       run();
@@ -99,6 +111,7 @@ fn desktop() {
       .spawn(run);
 }
 
+#[cfg(not(target_os = "macos"))]
 fn run() {
    // Unwinding out of a constructor aborts the host, so a bug here costs
    // plugins, not the app.
@@ -131,6 +144,7 @@ fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
 #[cfg(not(any(
    target_os = "android",
    target_os = "ios",
+   target_os = "macos",
    windows,
    all(target_os = "linux", target_arch = "x86_64")
 )))]
@@ -138,6 +152,7 @@ fn start(_home: PathBuf, _bundled: Vec<Plugin>) -> Result<Started, Error> {
    Err(Error::NoTarget)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn home() -> PathBuf {
    if let Some(home) = env::var_os("PHOENIX_HOME") {
       return PathBuf::from(home);
@@ -192,6 +207,7 @@ fn home() -> PathBuf {
    }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[cfg_attr(
    not(unix),
    allow(
@@ -216,7 +232,7 @@ fn bundled() -> Vec<Plugin> {
    }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod unix {
    use std::{
       collections::BTreeMap,
@@ -401,6 +417,44 @@ mod ios {
    }
 }
 
+/// Desktop Phoenix on macOS, where only the access gate opens: the Desktop
+/// plugin runtime's hooks decode x86-64, and the app is arm64 only.
+#[cfg(target_os = "macos")]
+mod macos {
+   use phoenix_runtime::Error;
+
+   /// `mov w0, #2; ret`
+   const NO_GATE: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
+
+   /// Makes the `ClientAccessGate` read answer "no gate". Runs from the
+   /// constructor, since Desktop Phoenix settles on the gate in its first
+   /// frames.
+   pub fn open_access_gate() {
+      let image = match phoenix_runtime::target() {
+         Ok(image) => image,
+         // The CEF helpers inherit `DYLD_INSERT_LIBRARIES` and have no gate.
+         Err(Error::NoTarget) => return,
+         Err(err) => {
+            log::error!("phoenix could not find Discord: {err}");
+            return;
+         },
+      };
+      let access = match phoenix_sigs::macos::access_gate(&image) {
+         Ok(access) => access,
+         Err(err) => {
+            log::warn!("{err}, leaving it");
+            return;
+         },
+      };
+      // SAFETY: Discord's own code, written from the constructor before it
+      // runs.
+      match unsafe { image.write_code(access, &NO_GATE) } {
+         Ok(()) => log::info!("access gate: open, plugins do not run on macOS yet"),
+         Err(err) => log::error!("access gate: {err}"),
+      }
+   }
+}
+
 #[cfg(target_os = "ios")]
 fn logging() {
    struct Syslog;
@@ -483,12 +537,21 @@ fn logging() {
 /// this library's own path because `/mnt/expand` is not listable), then
 /// secondary-user `/data/user/<uid>/<pkg>/files`, falling back to
 /// `/data/data/<pkg>/files`.
-#[cfg(all(unix, not(any(target_os = "ios", target_os = "linux"))))]
+#[cfg(all(
+   unix,
+   not(any(target_os = "ios", target_os = "linux", target_os = "macos"))
+))]
 fn android_files_dir(package: &str, user: u32, lib_path: Option<&str>) -> PathBuf {
    android_files_dir_with(package, user, lib_path, std::path::Path::is_dir)
 }
 
-#[cfg(any(test, all(unix, not(any(target_os = "ios", target_os = "linux")))))]
+#[cfg(any(
+   test,
+   all(
+      unix,
+      not(any(target_os = "ios", target_os = "linux", target_os = "macos"))
+   )
+))]
 fn android_files_dir_with(
    package: &str,
    user: u32,

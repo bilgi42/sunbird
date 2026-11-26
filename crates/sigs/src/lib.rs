@@ -12,6 +12,7 @@ use std::ffi::c_void;
 #[cfg(feature = "file")] pub mod file;
 #[cfg(target_arch = "x86_64")] pub mod http;
 pub mod ios;
+pub mod macos;
 pub mod mobile;
 pub mod registry;
 
@@ -38,9 +39,12 @@ pub struct StaffField {
 #[cfg(not(any(
    target_os = "windows",
    target_os = "ios",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64")
 )))]
 pub const LIBRARIES: &[&str] = &["liblibdiscord_wasm_host.so", "libstand_in.so"];
+#[cfg(target_os = "macos")]
+pub const LIBRARIES: &[&str] = &[macos::EXECUTABLE];
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const LIBRARIES: &[&str] = &["discord-phoenix", "libstand_in.so"];
 #[cfg(target_os = "ios")]

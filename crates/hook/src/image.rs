@@ -340,6 +340,14 @@ impl Image<'static> {
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
    static mach_task_self_: u32;
+   fn mach_vm_protect(
+      task: u32,
+      address: u64,
+      size: u64,
+      set_maximum: c_int,
+      protection: c_int,
+   ) -> c_int;
+   fn sys_icache_invalidate(start: *mut c_void, len: usize);
    fn vm_region_64(
       task: u32,
       address: *mut usize,
@@ -407,7 +415,7 @@ unsafe fn swap_protected(
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
    for (done, &(page, prot)) in restore.iter().enumerate() {
-      if let Err(err) = protect(page, prot | libc::PROT_WRITE) {
+      if let Err(err) = make_writable(page, page_size, prot, protect) {
          for &(page, prot) in &restore[..done] {
             let _ = protect(page, prot);
          }
@@ -423,8 +431,59 @@ unsafe fn swap_protected(
       .collect();
    for &(page, prot) in restore {
       let _ = protect(page, prot);
+      #[cfg(target_vendor = "apple")]
+      if prot & libc::PROT_EXEC != 0 {
+         // SAFETY: `page` is mapped, and arm64 can fetch stale instructions
+         // until the cache drops them.
+         unsafe { sys_icache_invalidate(page as *mut c_void, page_size) };
+      }
    }
    Ok(previous)
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn make_writable(
+   page: usize,
+   _page_size: usize,
+   prot: c_int,
+   protect: impl Fn(usize, c_int) -> Result<(), crate::Error>,
+) -> Result<(), crate::Error> {
+   protect(page, prot | libc::PROT_WRITE)
+}
+
+/// A signed code page's maximum protection leaves out write, and macOS refuses
+/// a page writable and executable at once, so code is written on a private
+/// copy of the page that is only readable and writable meanwhile.
+#[cfg(target_vendor = "apple")]
+fn make_writable(
+   page: usize,
+   page_size: usize,
+   prot: c_int,
+   protect: impl Fn(usize, c_int) -> Result<(), crate::Error>,
+) -> Result<(), crate::Error> {
+   const VM_PROT_COPY: c_int = 0x10;
+
+   if prot & libc::PROT_EXEC == 0 {
+      return protect(page, prot | libc::PROT_WRITE);
+   }
+   // SAFETY: `page` is a mapped page the caller looked up.
+   let status = unsafe {
+      mach_vm_protect(
+         mach_task_self_,
+         page as u64,
+         page_size as u64,
+         0,
+         libc::PROT_READ | libc::PROT_WRITE | VM_PROT_COPY,
+      )
+   };
+   if status == 0 {
+      Ok(())
+   } else {
+      Err(crate::Error::Protect {
+         addr:   page,
+         source: std::io::Error::other(format!("mach_vm_protect returned {status}")),
+      })
+   }
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
@@ -1248,6 +1307,44 @@ fn last_at_or_below(
 #[cfg(test)]
 mod tests {
    use super::*;
+
+   // `mov w0, #1; ret` on a 16 KB page of its own, since the page loses
+   // execute while it is written and must not hold the writer.
+   #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+   std::arch::global_asm!(
+      ".section __TEXT,__phoenix_test,regular,pure_instructions",
+      ".p2align 14",
+      ".globl _phoenix_test_answer",
+      ".private_extern _phoenix_test_answer",
+      "_phoenix_test_answer:",
+      "mov w0, #1",
+      "ret",
+      ".p2align 14",
+      ".text",
+   );
+
+   #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+   #[test]
+   fn write_code_rewrites_a_signed_function() {
+      unsafe extern "C" {
+         fn phoenix_test_answer() -> u32;
+      }
+      /// `mov w0, #2; ret`
+      const TWO: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
+
+      let call = std::hint::black_box(phoenix_test_answer as unsafe extern "C" fn() -> u32);
+      let addr = call as usize;
+      // SAFETY: the test binary's own images.
+      let images = unsafe { Image::loaded() };
+      let image = images
+         .iter()
+         .find(|image| image.is_code(addr))
+         .expect("the test's own text");
+      // SAFETY: nothing else calls `phoenix_test_answer`.
+      unsafe { image.write_code(addr, &TWO) }.expect("write_code");
+      // SAFETY: the bytes just written.
+      assert_eq!(unsafe { call() }, 2);
+   }
 
    #[test]
    fn function_bounds_read_the_fde_range() {
