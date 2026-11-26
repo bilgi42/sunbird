@@ -437,7 +437,7 @@ pub fn install(image: &Image<'static>) {
    // `.pdata`, and the trampoline replays `send`'s prologue.
    let installed = Installed {
       send:         unsafe { std::mem::transmute::<usize, SendFn>(trampoline) },
-      responses:    found.poll_result <= http::POLL_RESULT_SIZE,
+      responses:    found.responses == Ok(http::ResponseLayout::Legacy),
       request:      found.request,
       poll:         unsafe { std::mem::transmute::<usize, PollFn>(found.poll_fn) },
       host_alloc:   found
@@ -453,9 +453,8 @@ pub fn install(image: &Image<'static>) {
    }
    if !responses {
       log::warn!(
-         "discord desktop: hooked HTTP send, but poll writes {:#x} bytes of its result, so \
-          responses are left alone",
-         found.poll_result
+         "discord desktop: hooked HTTP send, but responses are left alone: {:x?}",
+         found.responses
       );
       return;
    }
