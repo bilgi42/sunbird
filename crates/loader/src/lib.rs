@@ -426,6 +426,9 @@ mod macos {
    /// `mov w0, #2; ret`
    const NO_GATE: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
 
+   /// `mov w0, #0; ret`
+   const NOT_ENFORCED: [u8; 8] = [0x00, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
+
    /// Makes the `ClientAccessGate` read answer "no gate". Runs from the
    /// constructor, since Desktop Phoenix settles on the gate in its first
    /// frames.
@@ -446,11 +449,21 @@ mod macos {
             return;
          },
       };
+      // Located before `read` is rewritten, since it is found through it.
+      let enforced = phoenix_sigs::macos::access_enforced(&image, access);
       // SAFETY: Discord's own code, written from the constructor before it
       // runs.
       match unsafe { image.write_code(access, &NO_GATE) } {
          Ok(()) => log::info!("access gate: open, plugins do not run on macOS yet"),
          Err(err) => log::error!("access gate: {err}"),
+      }
+      // `push_access` asks `enforced` itself and drops every message alert for
+      // a gated account, so notifications and their sounds need this too.
+      // SAFETY: as above.
+      match enforced.map(|enforced| unsafe { image.write_code(enforced, &NOT_ENFORCED) }) {
+         Ok(Ok(())) => log::info!("access gate: not enforced, message alerts are on"),
+         Ok(Err(err)) => log::error!("access gate: {err}"),
+         Err(err) => log::warn!("{err}, message alerts stay off"),
       }
    }
 }
