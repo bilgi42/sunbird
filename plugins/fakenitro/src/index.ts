@@ -122,7 +122,7 @@ const load = async () => {
       if (s) addStickers(JSON.parse(s));
     }
   } catch {
-    // android < 12 sqlite has no json_extract, fall back to parsing in js
+    // Older Android SQLite builds lack json_extract, so parse the rows in JS.
     const guilds = await phoenix.stores
       .sql<{ g: string; v: string | null }>("SELECT k AS g, CAST(v AS TEXT) AS v FROM guilds")
       .catch(() => []);
@@ -180,7 +180,7 @@ if (gateway.guildStickersUpdate) {
 const applyUser = (user: { id?: string; premium_type?: number } | null | undefined) => {
   if (!user?.id) return;
   premiumType = user.premium_type ?? 0;
-  // desktop switches accounts without reloading plugins
+  // Desktop switches accounts without reloading plugins.
   if (currentUserId !== null && currentUserId !== user.id) {
     for (const map of [emojis, byName, stickers, channelGuild, picked] as Map<string, unknown>[]) map.clear();
     reload();
@@ -215,6 +215,7 @@ const readTier = () =>
       fetchMeFallback();
     });
 readTier();
+// READY skips the event registry on mobile, so this only fires on Desktop.
 if (gateway.ready) {
   phoenix.on(gateway.ready, (ready) => applyUser(ready.user));
 }
@@ -279,7 +280,6 @@ const guildOf = (ctx: Phoenix.UiContext) => (ctx.channelId ? channelGuild.get(ct
 // the message box instead, like an unlocked pick, and remember which emoji it
 // was, since several servers can have one by that name.
 phoenix.messages.onEmojiPick((id, ctx) => {
-  readTier();
   const emoji = emojis.get(id);
   if (!emoji || usable(emoji, guildOf(ctx))) return;
   picked.set(emoji.name, emoji);
@@ -301,9 +301,9 @@ const sendChannelId = (path: string) => {
   return match ? match[1] : undefined;
 };
 
-// catch outgoing sends/edits even if the mobile composer hook missed them
+// Sends and edits the composer hook missed, like a picked emoji the mirror
+// didn't see. Text onSend already rewrote comes through unchanged.
 const rewriteRequest = (req: Phoenix.InterceptedRequest): Phoenix.RequestHookResult => {
-  readTier();
   if (!req.body.includes(":")) return;
   const body = req.json<{ content?: unknown }>();
   if (!body || typeof body.content !== "string" || !body.content.includes(":")) return;
