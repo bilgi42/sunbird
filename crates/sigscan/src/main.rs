@@ -41,11 +41,13 @@ use phoenix_sigs::{
    },
    http::DesktopHttpTransport,
    ios,
+   macos,
    mobile,
    registry::GatewayRegistry,
 };
 
-const USAGE: &str = "usage: sigscan <library.so | Discord.exe | PhoenixFatClient | main.jsbundle> \
+const USAGE: &str = "usage: sigscan <library.so | Discord.exe | Discord | PhoenixFatClient | \
+                     main.jsbundle> \
                      [check | strings <text> | refs <addr> | dis <addr> [count]]";
 
 fn main() -> misstep::Result<()> {
@@ -343,6 +345,9 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                )
             }),
          );
+      },
+      Machine::Aarch64 if macho && image.file_name() == macos::EXECUTABLE => {
+         report("access gate", macos::access_gate(image).map(at));
       },
       Machine::Aarch64 if macho => {
          report(
