@@ -93,6 +93,8 @@ pub struct DesktopHttpTransport {
    pub poll_fn:      usize,
    /// How `poll` lays out its result.
    pub responses:    Found<ResponseLayout>,
+   /// The `SendFuture`'s drop, beside every poll slot.
+   pub poll_drop:    Found<usize>,
    /// Host's `__rust_alloc(size, align)` if located.
    pub host_alloc:   Option<usize>,
    /// Host's `__rust_dealloc(ptr, size, align)` if located.
@@ -149,6 +151,16 @@ impl DesktopHttpTransport {
       if !poll_slots.contains(&direct_slot) {
          poll_slots.push(direct_slot);
       }
+      let mut drops: Vec<usize> = poll_slots
+         .iter()
+         .filter_map(|&slot| image.read_usize(slot.checked_sub(24)?))
+         .collect();
+      drops.sort_unstable();
+      drops.dedup();
+      let poll_drop = match drops[..] {
+         [drop] if image.is_function(drop) => Ok(drop),
+         _ => Err(format!("poll's vtables hold {drops:#x?} as their drop")),
+      };
 
       // 4. The host's own `__rust_alloc` and `__rust_dealloc`, so response body
       //    growth stays allocator-compatible. Both hand the same global
@@ -173,6 +185,7 @@ impl DesktopHttpTransport {
          poll_slots,
          poll_fn,
          responses,
+         poll_drop,
          host_alloc,
          host_dealloc,
       })
