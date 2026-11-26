@@ -139,10 +139,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "http responses",
             http.as_ref().map_err(Clone::clone).and_then(|http| {
-               http
-                  .responses
-                  .clone()
-                  .map(|layout| format!("{} {layout:x?}", at(http.poll_fn)))
+               let poll = at(http.poll_fn);
+               match http.responses.clone()? {
+                  layout @ phoenix_sigs::http::ResponseLayout::Legacy => {
+                     Ok(format!("{poll} {layout:x?}"))
+                  },
+                  layout => {
+                     let drop = at(http.poll_drop.clone()?);
+                     Ok(format!("{poll} drop {drop} {layout:x?}"))
+                  },
+               }
             }),
          );
          report(
