@@ -12,6 +12,7 @@ use phoenix_hook::{
    image::Image,
    x86::{
       Abi,
+      Store,
       call_target,
       jump_target,
    },
@@ -30,8 +31,38 @@ pub const BODY_SIZE: usize = 0x38;
 /// The size of a `String`, and of an `http::Method`.
 pub const STRING_SIZE: usize = 0x18;
 /// The size of the `Poll<Result<Response>>` the runtime reads `poll`'s result
-/// as.
+/// as on builds whose `poll` writes no further.
 pub const POLL_RESULT_SIZE: usize = 0x80;
+/// The size of the response's body enum: its tag and a `bytes::Bytes` or a
+/// `Box<dyn Stream>`.
+pub const RESPONSE_BODY_SIZE: usize = 0x28;
+/// The body enum's tag for a `Box<dyn Stream>`, the one `poll` stores as a
+/// constant.
+pub const RESPONSE_BODY_STREAM: u64 = 1;
+
+/// How `poll`'s `Poll<Result<Response>>` is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseLayout {
+   /// The fixed [`POLL_RESULT_SIZE`] layout with the body in a `Vec<u8>`.
+   Legacy,
+   /// A layout read from `poll`'s stores.
+   Located(ResultLayout),
+}
+
+/// Where a located `poll` result keeps the fields the runtime touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultLayout {
+   /// The whole result's size.
+   pub size:    usize,
+   /// Word 0 of a `Poll::Pending`.
+   pub pending: u64,
+   /// Word 0 of a `Poll::Ready(Err)`.
+   pub err:     u64,
+   /// The `u16` status.
+   pub status:  usize,
+   /// The body enum's tag, followed by its payload.
+   pub body:    usize,
+}
 
 /// Where `send`'s request keeps the fields the runtime reads, after the
 /// `http::HeaderMap` it starts with. Builds move them as fields are added.
@@ -60,9 +91,10 @@ pub struct DesktopHttpTransport {
    pub poll_slots:   Vec<usize>,
    /// Original `SendFuture::poll` function address.
    pub poll_fn:      usize,
-   /// How many bytes of its result `poll` writes, as far as it can be
-   /// followed. A build past [`POLL_RESULT_SIZE`] changed the response.
-   pub poll_result:  usize,
+   /// How `poll` lays out its result.
+   pub responses:    Found<ResponseLayout>,
+   /// The `SendFuture`'s drop, beside every poll slot.
+   pub poll_drop:    Found<usize>,
    /// Host's `__rust_alloc(size, align)` if located.
    pub host_alloc:   Option<usize>,
    /// Host's `__rust_dealloc(ptr, size, align)` if located.
@@ -106,18 +138,29 @@ impl DesktopHttpTransport {
       let (poll_fn, poll_vtable, box_future) = find_poll_vtable(image, send_fn, send_end)?;
       let mut poll_slots = find_vtable_method_slots(image, poll_fn, 0x100..=0x4000);
       // shortcut: a result pointer `poll` keeps on the stack is not
-      // followed, so this only catches a build that writes past the layout
-      // through a register, as the one from 2026-11-23 does.
-      let poll_result = image
+      // followed, so a build that writes past the legacy layout is only told
+      // apart when it writes through a register, as the ones from 2026-11-23
+      // on do.
+      let responses = image
          .function_bounds(poll_fn)
          .and_then(|(start, end)| image.read(start, end - start).map(|code| (start, code)))
-         .map_or(0, |(start, code)| {
-            phoenix_hook::x86::arg_use(abi, 0, code, start).extent
+         .map_or(Ok(ResponseLayout::Legacy), |(start, code)| {
+            response_layout(&phoenix_hook::x86::arg_use(abi, 0, code, start))
          });
       let direct_slot = poll_vtable + 24;
       if !poll_slots.contains(&direct_slot) {
          poll_slots.push(direct_slot);
       }
+      let mut drops: Vec<usize> = poll_slots
+         .iter()
+         .filter_map(|&slot| image.read_usize(slot.checked_sub(24)?))
+         .collect();
+      drops.sort_unstable();
+      drops.dedup();
+      let poll_drop = match drops[..] {
+         [drop] if image.is_function(drop) => Ok(drop),
+         _ => Err(format!("poll's vtables hold {drops:#x?} as their drop")),
+      };
 
       // 4. The host's own `__rust_alloc` and `__rust_dealloc`, so response body
       //    growth stays allocator-compatible. Both hand the same global
@@ -141,7 +184,8 @@ impl DesktopHttpTransport {
          request,
          poll_slots,
          poll_fn,
-         poll_result,
+         responses,
+         poll_drop,
          host_alloc,
          host_dealloc,
       })
@@ -193,6 +237,99 @@ fn request_layout(abi: Abi, code: &[u8], ip: usize) -> Found<RequestLayout> {
       ));
    }
    Ok(RequestLayout { body, url, method })
+}
+
+/// Reads how `poll` lays out its result from the stores it makes through it.
+///
+/// Every return writes its tag to word 0: Pending a constant on its own, and
+/// Err a constant in the tail it shares with Ok, which goes on to store the
+/// status, the one `u16`. The body enum's stream case stores its tag as a
+/// constant, then the box's data pointer and vtable.
+fn response_layout(used: &phoenix_hook::x86::ArgUse) -> Found<ResponseLayout> {
+   if used.extent <= POLL_RESULT_SIZE {
+      return Ok(ResponseLayout::Legacy);
+   }
+   let stores = &used.stores;
+   let size = stores
+      .iter()
+      .map(|store| store.offset + store.size)
+      .max()
+      .unwrap_or(0)
+      .next_multiple_of(8);
+
+   let mut statuses: Vec<(usize, usize)> = stores
+      .iter()
+      .enumerate()
+      .filter(|(_, store)| store.size == 2)
+      .map(|(at, store)| (store.offset, at))
+      .collect();
+   statuses.sort_unstable();
+   statuses.dedup_by_key(|&mut (offset, _)| offset);
+   let [(status, status_at)] = statuses[..] else {
+      return Err(format!(
+         "{} word stores could each be the status",
+         statuses.len()
+      ));
+   };
+
+   let tag = |store: &Store| (store.offset == 0 && store.size == 8).then_some(store.constant);
+   let mut tags: Vec<u64> = stores.iter().filter_map(tag).flatten().collect();
+   tags.sort_unstable();
+   tags.dedup();
+   let err = stores[..status_at]
+      .iter()
+      .rev()
+      .find_map(tag)
+      .flatten()
+      .ok_or("the status is not stored after a constant tag")?;
+   let others: Vec<u64> = tags.iter().copied().filter(|&value| value != err).collect();
+   let [pending] = others[..] else {
+      return Err(format!("tags {tags:#x?} are not one Pending and one Err"));
+   };
+
+   let written = |offset: usize| {
+      stores
+         .iter()
+         .any(|store| store.offset == offset && store.size == 8)
+   };
+   let mut bodies: Vec<usize> = stores
+      .iter()
+      .filter(|store| {
+         store.offset != 0
+            && store.size == 8
+            && store.constant == Some(RESPONSE_BODY_STREAM)
+            && written(store.offset + 8)
+            && written(store.offset + 0x10)
+      })
+      .map(|store| store.offset)
+      .collect();
+   bodies.sort_unstable();
+   bodies.dedup();
+   let [body] = bodies[..] else {
+      return Err(format!("{bodies:#x?} could each be the body's tag"));
+   };
+
+   // The runtime takes a reference to each field, so they must not overlap.
+   let mut fields = [(0, 8), (body, RESPONSE_BODY_SIZE), (status, 2)];
+   fields.sort_unstable();
+   if fields
+      .windows(2)
+      .any(|pair| pair[0].0 + pair[0].1 > pair[1].0)
+      || fields.iter().any(|&(offset, len)| offset + len > size)
+      || body % 8 != 0
+      || status % 2 != 0
+   {
+      return Err(format!(
+         "body {body:#x} and status {status:#x} overlap in {size:#x} bytes"
+      ));
+   }
+   Ok(ResponseLayout::Located(ResultLayout {
+      size,
+      pending,
+      err,
+      status,
+      body,
+   }))
 }
 
 /// Finds all `.rdata` vtable method-0 slots (`vtable + 24`) holding `method_fn`
@@ -503,6 +640,90 @@ mod tests {
             method: 0xF8,
          })
       );
+   }
+
+   /// Pieces of `SendFuture::poll` from the Linux build 2233: its entry, its
+   /// Pending return, and the tail its Err and Ok returns share.
+   const POLL: &[u8] = &[
+      0x49, 0x89, 0xD4, // mov r12, rdx
+      0x48, 0x89, 0xF3, // mov rbx, rsi
+      0x49, 0x89, 0xFE, // mov r14, rdi
+      0x49, 0x83, 0xFF, 0x02, // cmp r15, 2
+      0x75, 0x0B, // jne
+      0x49, 0x83, 0x0E, 0xFF, // or qword [r14], -1
+      0xB0, 0x03, // mov al, 3
+      0xE9, 0xEB, 0x02, 0x00, 0x00, // jmp
+      0x6A, 0x02, // push 2
+      0x5D, // pop rbp
+      0x80, 0xBB, 0x53, 0x05, 0x00, 0x00, 0x01, // cmp byte [rbx+0x553], 1
+      0x75, 0x0C, // jne
+      0x48, 0x8D, 0xBB, 0x10, 0x01, 0x00, 0x00, // lea rdi, [rbx+0x110]
+      0xE8, 0xF2, 0x7F, 0x07, 0xFA, // call
+      0x49, 0x89, 0x2E, // mov [r14], rbp
+      0x4D, 0x89, 0x6E, 0x08, // mov [r14+8], r13
+      0x0F, 0x28, 0x44, 0x24, 0x20, // movaps xmm0, [rsp+0x20]
+      0x41, 0x0F, 0x11, 0x46, 0x10, // movups [r14+0x10], xmm0
+      0x48, 0x8B, 0x44, 0x24, 0x30, // mov rax, [rsp+0x30]
+      0x49, 0x89, 0x46, 0x20, // mov [r14+0x20], rax
+      0x49, 0x8D, 0x7E, 0x28, // lea rdi, [r14+0x28]
+      0x48, 0x8D, 0xB4, 0x24, 0x48, 0x09, 0x00, 0x00, // lea rsi, [rsp+0x948]
+      0xB9, 0x50, 0x01, 0x00, 0x00, // mov ecx, 0x150
+      0xF3, 0xA4, // rep movsb
+      0x49, 0xC7, 0x86, 0x78, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+      0x00, // mov qword [r14+0x178], 1
+      0x4D, 0x89, 0xA6, 0x80, 0x01, 0x00, 0x00, // mov [r14+0x180], r12
+      0x48, 0x8D, 0x05, 0xAC, 0xCB, 0x8F, 0x01, // lea rax, [rip+0x18FCBAC]
+      0x49, 0x89, 0x86, 0x88, 0x01, 0x00, 0x00, // mov [r14+0x188], rax
+      0x0F, 0x10, 0x84, 0x24, 0xF8, 0x00, 0x00, 0x00, // movups xmm0, [rsp+0xF8]
+      0x0F, 0x10, 0x8C, 0x24, 0x08, 0x01, 0x00, 0x00, // movups xmm1, [rsp+0x108]
+      0x41, 0x0F, 0x11, 0x86, 0x90, 0x01, 0x00, 0x00, // movups [r14+0x190], xmm0
+      0x41, 0x0F, 0x11, 0x8E, 0xA0, 0x01, 0x00, 0x00, // movups [r14+0x1A0], xmm1
+      0x48, 0x8B, 0x84, 0x24, 0x18, 0x01, 0x00, 0x00, // mov rax, [rsp+0x118]
+      0x49, 0x89, 0x86, 0xB0, 0x01, 0x00, 0x00, // mov [r14+0x1B0], rax
+      0x4D, 0x89, 0xBE, 0xB8, 0x01, 0x00, 0x00, // mov [r14+0x1B8], r15
+      0x66, 0x41, 0x89, 0x96, 0xC0, 0x01, 0x00, 0x00, // mov [r14+0x1C0], dx
+      0x45, 0x88, 0x86, 0xC2, 0x01, 0x00, 0x00, // mov [r14+0x1C2], r8b
+      0xB0, 0x01, // mov al, 1
+      0x88, 0x83, 0x51, 0x05, 0x00, 0x00, // mov [rbx+0x551], al
+      0x4C, 0x89, 0xF0, // mov rax, r14
+   ];
+
+   fn layout(code: &[u8]) -> Found<ResponseLayout> {
+      response_layout(&phoenix_hook::x86::arg_use(Abi::SysV, 0, code, 0x1840_2ADF))
+   }
+
+   #[test]
+   fn reads_the_response_layout_from_poll() {
+      assert_eq!(
+         layout(POLL),
+         Ok(ResponseLayout::Located(ResultLayout {
+            size:    0x1C8,
+            pending: u64::MAX,
+            err:     2,
+            status:  0x1C0,
+            body:    0x178,
+         }))
+      );
+   }
+
+   #[test]
+   fn keeps_the_legacy_layout_within_its_size() {
+      let poll = [
+         0x49, 0x89, 0xFE, // mov r14, rdi
+         0x66, 0x41, 0x89, 0x56, 0x78, // mov [r14+0x78], dx
+      ];
+      assert_eq!(layout(&poll), Ok(ResponseLayout::Legacy));
+   }
+
+   #[test]
+   fn refuses_a_response_without_a_stream_tag() {
+      let mut poll = POLL.to_vec();
+      let tag = poll
+         .windows(7)
+         .position(|code| code == [0x49, 0xC7, 0x86, 0x78, 0x01, 0x00, 0x00])
+         .expect("POLL stores the body's tag");
+      poll[tag + 7] = 3;
+      assert!(layout(&poll).is_err());
    }
 
    #[test]

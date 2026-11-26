@@ -267,6 +267,19 @@ pub struct ArgUse {
    pub copies:     Vec<StructCopy>,
    /// Offsets whose value indexes a jump table.
    pub dispatches: Vec<usize>,
+   /// Each write through the pointer, in decoding order.
+   pub stores:     Vec<Store>,
+}
+
+/// A write into the struct [`arg_use`] follows.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Store {
+   pub offset:   usize,
+   /// A `rep movsb` counts as one store of the copied length.
+   pub size:     usize,
+   /// The value written, when an immediate or a register loaded with one
+   /// gives it, as in `mov [ptr], imm`, `or [ptr], -1` and `and [ptr], 0`.
+   pub constant: Option<u64>,
 }
 
 /// A `rep movsb` out of the struct [`arg_use`] follows.
@@ -348,6 +361,86 @@ impl ArgTracker {
          })
          .flatten()
          .map(|offset| (operand, offset))
+   }
+
+   fn constant(&self, register: Register) -> Option<u64> {
+      let register = register.full_register();
+      self
+         .constant
+         .iter()
+         .find(|(held, _)| *held == register)
+         .map(|&(_, value)| value)
+   }
+
+   /// The value `instruction` leaves in its `size`-byte memory operand, when
+   /// it is known.
+   fn stored(&self, instruction: &Instruction, size: usize) -> Option<u64> {
+      use iced_x86::{
+         Mnemonic,
+         OpKind,
+      };
+      let mask = if size >= 8 {
+         u64::MAX
+      } else {
+         (1 << (8 * size)) - 1
+      };
+      let source = match instruction.op1_kind() {
+         OpKind::Register => self.constant(instruction.op1_register())?,
+         OpKind::Immediate8
+         | OpKind::Immediate16
+         | OpKind::Immediate32
+         | OpKind::Immediate8to16
+         | OpKind::Immediate8to32
+         | OpKind::Immediate8to64
+         | OpKind::Immediate32to64
+         | OpKind::Immediate64 => instruction.immediate(1),
+         _ => return None,
+      } & mask;
+      match instruction.mnemonic() {
+         Mnemonic::Mov => Some(source),
+         Mnemonic::Or if source == mask => Some(mask),
+         Mnemonic::And if source == 0 => Some(0),
+         _ => None,
+      }
+   }
+
+   /// The writes `instruction` makes into the struct.
+   fn store(&mut self, instruction: &Instruction, memory: &iced_x86::UsedMemory) {
+      use iced_x86::{
+         Mnemonic,
+         OpAccess,
+      };
+      if !matches!(
+         memory.access(),
+         OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+      ) || memory.index() != Register::None
+      {
+         return;
+      }
+      let Some(offset) = self.field(memory.base(), memory.displacement()) else {
+         return;
+      };
+      let store = if instruction.mnemonic() == Mnemonic::Movsb {
+         let Some(len) = self
+            .constant(Register::RCX)
+            .filter(|_| instruction.has_rep_prefix())
+         else {
+            return;
+         };
+         Store {
+            offset,
+            size: addr(len),
+            constant: None,
+         }
+      } else {
+         let size = memory.memory_size().size();
+         Store {
+            offset,
+            size,
+            constant: self.stored(instruction, size),
+         }
+      };
+      self.found.stores.push(store);
    }
 
    fn call(&mut self, abi: Abi) {
@@ -502,6 +595,7 @@ pub fn arg_use(abi: Abi, index: usize, code: &[u8], ip: usize) -> ArgUse {
                .extent
                .max(offset + memory.memory_size().size());
          }
+         tracker.store(&instruction, memory);
       }
       let new = tracker
          .spill(&instruction)
@@ -1282,6 +1376,45 @@ mod tests {
          after_calls: 2,
       }]);
       assert_eq!(used.dispatches, [0x78]);
+   }
+
+   #[test]
+   fn arg_use_reads_constant_stores_through_the_return_pointer() {
+      // Pieces of `SendFuture::poll` from the Linux build 2233: its Pending
+      // return, and the tail its Err and Ok returns share.
+      let code = [
+         0x49, 0x89, 0xFE, // mov r14, rdi
+         0x49, 0x83, 0x0E, 0xFF, // or qword [r14], -1: Pending
+         0xE9, 0xEB, 0x02, 0x00, 0x00, // jmp
+         0x6A, 0x02, // push 2
+         0x5D, // pop rbp
+         0xE8, 0xF2, 0x7F, 0x07, 0xFA, // call: rbp survives it
+         0x49, 0x89, 0x2E, // mov [r14], rbp: Err
+         0x4D, 0x89, 0x6E, 0x08, // mov [r14+8], r13
+         0x49, 0x8D, 0x7E, 0x28, // lea rdi, [r14+0x28]
+         0xB9, 0x50, 0x01, 0x00, 0x00, // mov ecx, 0x150
+         0xF3, 0xA4, // rep movsb
+         0x49, 0xC7, 0x86, 0x78, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+         0x00, // mov qword [r14+0x178], 1
+         0x41, 0x0F, 0x11, 0x86, 0x90, 0x01, 0x00, 0x00, // movups [r14+0x190], xmm0
+         0x66, 0x41, 0x89, 0x96, 0xC0, 0x01, 0x00, 0x00, // mov [r14+0x1C0], dx
+      ];
+      let store = |offset, size, constant| {
+         Store {
+            offset,
+            size,
+            constant,
+         }
+      };
+      assert_eq!(arg_use(Abi::SysV, 0, &code, 0x1000).stores, [
+         store(0, 8, Some(u64::MAX)),
+         store(0, 8, Some(2)),
+         store(8, 8, None),
+         store(0x28, 0x150, None),
+         store(0x178, 8, Some(1)),
+         store(0x190, 0x10, None),
+         store(0x1C0, 2, None),
+      ]);
    }
 
    #[test]

@@ -47,8 +47,7 @@ use phoenix_sigs::{
 };
 
 const USAGE: &str = "usage: sigscan <library.so | Discord.exe | Discord | PhoenixFatClient | \
-                     main.jsbundle> \
-                     [check | strings <text> | refs <addr> | dis <addr> [count]]";
+                     main.jsbundle> [check | strings <text> | refs <addr> | dis <addr> [count]]";
 
 fn main() -> misstep::Result<()> {
    misstep::install_panic_hook();
@@ -140,9 +139,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "http responses",
             http.as_ref().map_err(Clone::clone).and_then(|http| {
-               (http.poll_result <= phoenix_sigs::http::POLL_RESULT_SIZE)
-                  .then(|| at(http.poll_fn))
-                  .ok_or_else(|| format!("poll writes {:#x} bytes of its result", http.poll_result))
+               let poll = at(http.poll_fn);
+               match http.responses.clone()? {
+                  layout @ phoenix_sigs::http::ResponseLayout::Legacy => {
+                     Ok(format!("{poll} {layout:x?}"))
+                  },
+                  layout => {
+                     let drop = at(http.poll_drop.clone()?);
+                     Ok(format!("{poll} drop {drop} {layout:x?}"))
+                  },
+               }
             }),
          );
          report(

@@ -6,14 +6,19 @@
 //! the `SendFuture::poll` vtable slots (build-independently via
 //! [`DesktopHttpTransport::locate`]). The API client calls `send` directly, so
 //! `send` gets an inline jump to its detour with a trampoline back, and the
-//! poll slots are swapped with [`Image::swap_words`].
+//! poll slots are swapped with [`Image::swap_words`]. Builds whose responses
+//! stream their bodies have them collected inside `poll`, so the hooks see the
+//! whole body before the status goes out, and the drop slots beside the poll
+//! slots are swapped too, to free a collection its future leaves behind.
 //!
 //! Captured session headers stay in memory only and `authorization` is never
 //! logged or persisted.
 
 use std::{
    borrow::Cow,
+   collections::HashMap,
    ffi::c_void,
+   mem::MaybeUninit,
    panic::{
       self,
       AssertUnwindSafe,
@@ -23,9 +28,13 @@ use std::{
    str,
    sync::{
       Arc,
+      LazyLock,
+      Mutex,
       OnceLock,
+      PoisonError,
       atomic::{
          AtomicPtr,
+         AtomicUsize,
          Ordering,
       },
    },
@@ -36,6 +45,7 @@ use phoenix_runtime::{
    discord::{
       Authorization,
       DiscordError,
+      InFlight,
       RequestAction,
       api_path,
       observe_request,
@@ -273,19 +283,153 @@ impl RawPollResult {
    }
 }
 
-// `send` and `poll` are Rust-ABI trait methods, declared Rust ABI here so the
-// same lowering applies on Win64 and SysV: `send` returns its pointer pair
-// (`Pin<Box<dyn Future>>`) in RAX:RDX, and `poll` returns the 128-byte
-// `RawPollResult` through a hidden sret pointer in the first argument register.
+/// The response's body enum in a located result.
+#[repr(C)]
+struct RawResponseBody {
+   tag:     u64,
+   payload: [usize; 4],
+}
+const _: () = assert!(size_of::<RawResponseBody>() == http::RESPONSE_BODY_SIZE);
+
+/// What a [`RawResponseBody`] holds.
+enum Body {
+   Full,
+   Stream(RawStream),
+   Empty,
+   Unknown(u64),
+}
+
+impl RawResponseBody {
+   const FULL: u64 = 0;
+   const STREAM: u64 = http::RESPONSE_BODY_STREAM;
+   const EMPTY: u64 = 2;
+
+   const fn kind(&self) -> Body {
+      match self.tag {
+         Self::FULL => Body::Full,
+         Self::STREAM => {
+            Body::Stream(RawStream {
+               data:   self.payload[0] as *mut c_void,
+               vtable: self.payload[1] as *const RawStreamVtable,
+            })
+         },
+         Self::EMPTY => Body::Empty,
+         tag => Body::Unknown(tag),
+      }
+   }
+
+   /// # Safety
+   ///
+   /// The body is [`Body::Full`].
+   const unsafe fn bytes(&self) -> &RawBytes {
+      // SAFETY: a full body's payload is its `Bytes`.
+      unsafe { &*self.payload.as_ptr().cast::<RawBytes>() }
+   }
+
+   /// Makes the body `data`, or empty when there is none. The old contents
+   /// must already be dropped.
+   fn set(&mut self, data: Vec<u8>) {
+      if data.is_empty() {
+         self.tag = Self::EMPTY;
+         return;
+      }
+      self.tag = Self::FULL;
+      // SAFETY: the payload is as large and aligned as a `Bytes`.
+      unsafe { ptr::write(self.payload.as_mut_ptr().cast(), make_owned_bytes(data)) };
+   }
+}
+
+/// The host's `Box<dyn Stream>` of body chunks.
+#[derive(Clone, Copy)]
+struct RawStream {
+   data:   *mut c_void,
+   vtable: *const RawStreamVtable,
+}
+
+// SAFETY: reqwest's body streams are `Send`, since Discord's futures move
+// between the runtime's worker threads.
+unsafe impl Send for RawStream {}
+
+#[repr(C)]
+struct RawStreamVtable {
+   drop:      Option<unsafe extern "C" fn(*mut c_void)>,
+   size:      usize,
+   align:     usize,
+   poll_next: unsafe extern "C" fn(*mut RawChunk, *mut c_void, *mut c_void) -> *mut RawChunk,
+}
+
+/// `Poll<Option<Result<Bytes, E>>>`, a stream's `poll_next`.
+#[repr(C)]
+struct RawChunk {
+   tag:   u64,
+   bytes: RawBytes,
+}
+
+impl RawChunk {
+   const OK: u64 = 0;
+   const END: u64 = 2;
+   const PENDING: u64 = u64::MAX;
+}
+
+/// A located `poll` result's fields.
+struct LocatedResult<'a> {
+   tag:    u64,
+   status: &'a mut u16,
+   body:   &'a mut RawResponseBody,
+}
+
+impl LocatedResult<'_> {
+   /// # Safety
+   ///
+   /// `out` holds a result laid out as `layout` says, which
+   /// `DesktopHttpTransport::locate` checked has no overlapping fields.
+   unsafe fn at(out: *mut c_void, layout: http::ResultLayout) -> Self {
+      // SAFETY: forwarded from the caller.
+      unsafe {
+         Self {
+            tag:    out.cast::<u64>().read(),
+            status: &mut *out.byte_add(layout.status).cast(),
+            body:   &mut *out.byte_add(layout.body).cast(),
+         }
+      }
+   }
+}
+
+// `send` is declared Rust ABI so it lowers like the host's trait method on
+// Win64 and SysV, returning `Pin<Box<dyn Future>>` in RAX:RDX. `poll` returns
+// its result through an sret pointer in the first argument register and hands
+// it back in RAX, which `extern "C"` with the pointer spelled out matches.
+// Taking the buffer explicitly lets the detour forward the caller's own: the
+// original writes as much of its result as its build's layout needs, which can
+// exceed the `RawPollResult` the runtime reads, and a local of that size would
+// overflow.
 type SendFn = unsafe fn(*const c_void, *mut c_void) -> RawPinnedFuture;
-type PollFn = unsafe fn(*mut c_void, *mut c_void) -> RawPollResult;
+type PollFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
+type DropFn = unsafe extern "C" fn(*mut c_void);
 type HostAllocFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
 type HostDeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
 
+/// How responses reach the plugins.
+#[derive(Clone, Copy)]
+enum Responses {
+   /// `poll` is left alone.
+   Off,
+   /// `poll`'s result is a [`RawPollResult`].
+   Legacy,
+   Located(Located),
+}
+
+/// A located result, and what freeing a streamed body it drains takes.
+#[derive(Clone, Copy)]
+struct Located {
+   layout:  http::ResultLayout,
+   drop:    DropFn,
+   dealloc: HostDeallocFn,
+}
+
 struct Installed {
    send:         SendFn,
-   /// Whether `poll` is hooked, so responses reach the plugins.
-   responses:    bool,
+   responses:    Responses,
    request:      http::RequestLayout,
    poll:         PollFn,
    host_alloc:   Option<HostAllocFn>,
@@ -430,39 +574,56 @@ pub fn install(image: &Image<'static>) {
    };
    // SAFETY: `DesktopHttpTransport::locate` verified every target against
    // `.pdata`, and the trampoline replays `send`'s prologue.
+   let host_dealloc = found
+      .host_dealloc
+      .map(|addr| unsafe { std::mem::transmute::<usize, HostDeallocFn>(addr) });
+   let responses = match responses(&found, host_dealloc) {
+      Ok(responses) => responses,
+      Err(err) => {
+         log::warn!("discord desktop: responses are left alone: {err}");
+         Responses::Off
+      },
+   };
+   // SAFETY: as above.
    let installed = Installed {
-      send:         unsafe { std::mem::transmute::<usize, SendFn>(trampoline) },
-      responses:    found.poll_result <= http::POLL_RESULT_SIZE,
-      request:      found.request,
-      poll:         unsafe { std::mem::transmute::<usize, PollFn>(found.poll_fn) },
-      host_alloc:   found
+      send: unsafe { std::mem::transmute::<usize, SendFn>(trampoline) },
+      responses,
+      request: found.request,
+      poll: unsafe { std::mem::transmute::<usize, PollFn>(found.poll_fn) },
+      host_alloc: found
          .host_alloc
          .map(|addr| unsafe { std::mem::transmute::<usize, HostAllocFn>(addr) }),
-      host_dealloc: found
-         .host_dealloc
-         .map(|addr| unsafe { std::mem::transmute::<usize, HostDeallocFn>(addr) }),
+      host_dealloc,
    };
-   let responses = installed.responses;
    if INSTALLED.set(installed).is_err() {
       return;
    }
-   if !responses {
-      log::warn!(
-         "discord desktop: hooked HTTP send, but poll writes {:#x} bytes of its result, so \
-          responses are left alone",
-         found.poll_result
-      );
-      return;
-   }
+   let drops = match responses {
+      Responses::Off => {
+         log::info!("discord desktop: hooked HTTP send");
+         return;
+      },
+      Responses::Legacy => Vec::new(),
+      // A vtable's drop is its first word, three before its poll.
+      Responses::Located(_) => {
+         found
+            .poll_slots
+            .iter()
+            .map(|&slot| (slot - 24, drop_detour as *const () as usize))
+            .collect()
+      },
+   };
 
-   let polls = found
+   let swaps = found
       .poll_slots
       .iter()
       .map(|&slot| (slot, poll_detour as *const () as usize))
+      .chain(drops)
       .collect::<Vec<_>>();
    // SAFETY: every poll slot is an aligned `.rdata` vtable entry pointing to
-   // `poll_fn`, and `poll_detour` matches its Rust ABI.
-   match unsafe { image.swap_words(&polls) } {
+   // `poll_fn`, with the future's drop before it, and `poll_detour` and
+   // `drop_detour` match their lowering.
+   match unsafe { image.swap_words(&swaps) } {
       Ok(_) => {
          log::info!(
             "discord desktop: hooked HTTP send and {} poll vtable slots",
@@ -471,6 +632,29 @@ pub fn install(image: &Image<'static>) {
       },
       Err(err) => log::error!("discord desktop: failed to hook HTTP transport: {err}"),
    }
+}
+
+/// How `poll` can hand responses to the plugins.
+fn responses(
+   found: &DesktopHttpTransport,
+   dealloc: Option<HostDeallocFn>,
+) -> Result<Responses, String> {
+   let layout = match found.responses.clone()? {
+      http::ResponseLayout::Legacy => return Ok(Responses::Legacy),
+      http::ResponseLayout::Located(layout) => layout,
+   };
+   let drop = found.poll_drop.clone()?;
+   // A drained stream's box is freed through the host's allocator, and the
+   // body that replaces it hands copies out through it.
+   let (Some(dealloc), Some(_)) = (dealloc, found.host_alloc) else {
+      return Err("the host allocator is missing".to_owned());
+   };
+   Ok(Responses::Located(Located {
+      layout,
+      // SAFETY: `DesktopHttpTransport::locate` checked it is a function.
+      drop: unsafe { std::mem::transmute::<usize, DropFn>(drop) },
+      dealloc,
+   }))
 }
 
 /// # Safety
@@ -598,12 +782,9 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
             },
             RequestAction::Replace(new_body) => {
                if req_ref.body.tag == 1 && !req_ref.body.bytes.vtable.is_null() {
-                  let old_vtable = req_ref.body.bytes.vtable;
-                  let old_ptr = req_ref.body.bytes.ptr;
-                  let old_len = req_ref.body.bytes.len;
-                  let old_data = req_ref.body.bytes.data.load(Ordering::Relaxed);
-                  // SAFETY: drops the old `Bytes` via its own vtable.
-                  unsafe { ((*old_vtable).drop)(old_data, old_ptr, old_len) };
+                  // SAFETY: the old `Bytes` is the request's, replaced right
+                  // after.
+                  unsafe { drop_bytes(&req_ref.body.bytes) };
                   req_ref.body.bytes = make_owned_bytes(new_body);
                } else if req_ref.body.tag == 0 {
                   req_ref.body.tag = 1;
@@ -612,7 +793,7 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
             },
          }
 
-         if installed.responses {
+         if !matches!(installed.responses, Responses::Off) {
             watched = watch_response(&method, &url);
          }
       }))
@@ -633,17 +814,44 @@ unsafe fn send_detour(self_ptr: *const c_void, req: *mut c_void) -> RawPinnedFut
    future
 }
 
-unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
+unsafe extern "C" fn poll_detour(
+   out: *mut c_void,
+   future: *mut c_void,
+   cx: *mut c_void,
+) -> *mut c_void {
    let installed = INSTALLED
       .get()
       .expect("poll_detour only runs after INSTALLED is set");
-   // SAFETY: forward to original `SendFuture::poll`.
-   let mut result = unsafe { (installed.poll)(future, cx) };
+   match installed.responses {
+      // SAFETY: forwarded from the caller, which hands `poll`'s own arguments.
+      Responses::Located(located) => unsafe { located_poll(installed, located, out, future, cx) },
+      // SAFETY: as above.
+      Responses::Legacy => unsafe { legacy_poll(installed, out, future, cx) },
+      // SAFETY: as above.
+      Responses::Off => {
+         unsafe { (installed.poll)(out, future, cx) };
+      },
+   }
+   out
+}
+
+/// # Safety
+///
+/// `poll`'s arguments, on a build whose result is a [`RawPollResult`].
+unsafe fn legacy_poll(
+   installed: &Installed,
+   out: *mut c_void,
+   future: *mut c_void,
+   cx: *mut c_void,
+) {
+   // SAFETY: forward to original `SendFuture::poll` with the caller's buffer.
+   unsafe { (installed.poll)(out, future, cx) };
+   // SAFETY: the original filled `out`, which the caller owns for this call.
+   let result = unsafe { &mut *out.cast::<RawPollResult>() };
 
    if result.is_pending() {
-      return result;
+      return;
    }
-
    if let Some(in_flight) = take_response(future.addr() as u64)
       && result.is_ok()
       && panic::catch_unwind(AssertUnwindSafe(|| {
@@ -668,10 +876,270 @@ unsafe fn poll_detour(future: *mut c_void, cx: *mut c_void) -> RawPollResult {
    {
       log::error!("discord desktop: poll_detour panicked");
    }
-
-   result
 }
 
+/// A watched response whose streamed body `poll` is collecting. The future
+/// already completed, so its later polls continue this instead.
+struct Drain {
+   in_flight: InFlight,
+   /// The `Ready(Ok)` result the future returned, holding `stream` as its
+   /// body until it ends.
+   result:    Vec<u64>,
+   stream:    RawStream,
+   body:      Vec<u8>,
+}
+
+/// How far a [`Drain`] got.
+enum Drained {
+   /// The stream waits for more, and has `cx`'s waker.
+   Pending,
+   End,
+   /// The stream returned an error, or a tag this build does not know.
+   Failed(u64),
+}
+
+/// By the future's address.
+static DRAINS: LazyLock<Mutex<HashMap<usize, Drain>>> = LazyLock::new(Mutex::default);
+static DRAINING: AtomicUsize = AtomicUsize::new(0);
+
+fn stash(future: usize, drain: Drain) {
+   let mut drains = DRAINS.lock().unwrap_or_else(PoisonError::into_inner);
+   drains.insert(future, drain);
+   DRAINING.store(drains.len(), Ordering::Relaxed);
+}
+
+fn unstash(future: usize) -> Option<Drain> {
+   if DRAINING.load(Ordering::Relaxed) == 0 {
+      return None;
+   }
+   let mut drains = DRAINS.lock().unwrap_or_else(PoisonError::into_inner);
+   let drain = drains.remove(&future);
+   DRAINING.store(drains.len(), Ordering::Relaxed);
+   drain
+}
+
+/// # Safety
+///
+/// `poll`'s arguments, on a build whose result `located` describes.
+unsafe fn located_poll(
+   installed: &Installed,
+   located: Located,
+   out: *mut c_void,
+   future: *mut c_void,
+   cx: *mut c_void,
+) {
+   if let Some(drain) = unstash(future.addr()) {
+      // SAFETY: `drain` is this future's, and `out` is the caller's result.
+      guarded(|| unsafe { drain.resume(out, future.addr(), cx, located) });
+      return;
+   }
+   // SAFETY: forward to original `SendFuture::poll` with the caller's buffer.
+   unsafe { (installed.poll)(out, future, cx) };
+   // SAFETY: the original filled `out`, which the caller owns for this call.
+   guarded(|| unsafe { respond(out, future, cx, located) });
+}
+
+fn guarded(respond: impl FnOnce()) {
+   if panic::catch_unwind(AssertUnwindSafe(respond)).is_err() {
+      log::error!("discord desktop: poll_detour panicked");
+   }
+}
+
+/// Hands a watched response `poll` just returned to the hooks, draining its
+/// body first when it streams.
+///
+/// # Safety
+///
+/// `out` holds the result `poll` returned for `future` and `cx`, laid out as
+/// `located` says.
+unsafe fn respond(out: *mut c_void, future: *mut c_void, cx: *mut c_void, located: Located) {
+   let layout = located.layout;
+   // SAFETY: the original filled `out` as `layout` says.
+   let mut result = unsafe { LocatedResult::at(out, layout) };
+   if result.tag == layout.pending {
+      return;
+   }
+   let Some(in_flight) = take_response(future.addr() as u64) else {
+      return;
+   };
+   if result.tag == layout.err {
+      return;
+   }
+   match result.body.kind() {
+      Body::Full => {
+         // SAFETY: a full body holds a live `Bytes`.
+         let bytes = unsafe { result.body.bytes() };
+         // SAFETY: as above.
+         let old = unsafe { read_bytes(bytes) }.to_vec();
+         // SAFETY: the old `Bytes` is replaced right after.
+         unsafe { drop_bytes(bytes) };
+         result.body.set(Vec::new());
+         deliver(&mut result, in_flight, old);
+      },
+      Body::Empty => deliver(&mut result, in_flight, Vec::new()),
+      Body::Stream(stream) => {
+         let mut moved = vec![0_u64; layout.size / 8];
+         // SAFETY: `out` holds `layout.size` bytes of result.
+         unsafe {
+            ptr::copy_nonoverlapping(out.cast::<u64>(), moved.as_mut_ptr(), moved.len());
+         };
+         let drain = Drain {
+            in_flight,
+            result: moved,
+            stream,
+            body: Vec::new(),
+         };
+         // SAFETY: the stream is the result's, which `drain` now owns.
+         unsafe { drain.resume(out, future.addr(), cx, located) };
+      },
+      Body::Unknown(tag) => {
+         log::warn!("discord onResponse: unknown response body {tag}, delivering original");
+      },
+   }
+}
+
+impl Drain {
+   /// Polls the stream on, and writes Pending to `out` until it ends, then
+   /// the whole response.
+   ///
+   /// # Safety
+   ///
+   /// `self` is the drain of `future`, polled with `cx`, and `out` is the
+   /// caller's result buffer for this poll.
+   unsafe fn resume(mut self, out: *mut c_void, future: usize, cx: *mut c_void, located: Located) {
+      let layout = located.layout;
+      // Written first so a panic below leaves the caller a valid result,
+      // never the stream this frees.
+      // SAFETY: `out` holds at least a tag.
+      unsafe { out.cast::<u64>().write(layout.pending) };
+      // SAFETY: `self.stream` is live until `free_stream`.
+      let drained = unsafe { self.pull(cx) };
+      if matches!(drained, Drained::Pending) {
+         stash(future, self);
+         return;
+      }
+      // SAFETY: the stream ended, or failed and is abandoned.
+      unsafe { free_stream(self.stream, located.dealloc) };
+      // SAFETY: `self.result` holds a result laid out as `layout` says.
+      let mut result = unsafe { LocatedResult::at(self.result.as_mut_ptr().cast(), layout) };
+      result.body.tag = RawResponseBody::EMPTY;
+      match drained {
+         Drained::End => deliver(&mut result, self.in_flight, self.body),
+         Drained::Failed(tag) => {
+            log::warn!(
+               "discord onResponse: response body stream failed ({tag}), delivering {} bytes \
+                without hooks",
+               self.body.len()
+            );
+            result.body.set(self.body);
+         },
+         Drained::Pending => {},
+      }
+      // SAFETY: `out` holds `layout.size` bytes.
+      unsafe {
+         ptr::copy_nonoverlapping(self.result.as_ptr(), out.cast::<u64>(), self.result.len());
+      };
+   }
+
+   /// Collects chunks until the stream waits or stops.
+   ///
+   /// # Safety
+   ///
+   /// `self.stream` is live, and `cx` is the poll's context.
+   unsafe fn pull(&mut self, cx: *mut c_void) -> Drained {
+      loop {
+         let mut chunk = MaybeUninit::<RawChunk>::uninit();
+         // SAFETY: the stream's `poll_next` writes a chunk through its sret
+         // pointer.
+         unsafe { ((*self.stream.vtable).poll_next)(chunk.as_mut_ptr(), self.stream.data, cx) };
+         // SAFETY: every chunk starts with its tag.
+         let tag = unsafe { (&raw const (*chunk.as_ptr()).tag).read() };
+         match tag {
+            RawChunk::OK => {
+               // SAFETY: an Ok chunk holds a live `Bytes` we now own.
+               let bytes = unsafe { &(*chunk.as_ptr()).bytes };
+               // SAFETY: as above.
+               self.body.extend_from_slice(unsafe { read_bytes(bytes) });
+               // SAFETY: as above.
+               unsafe { drop_bytes(bytes) };
+            },
+            RawChunk::PENDING => return Drained::Pending,
+            RawChunk::END => return Drained::End,
+            tag => return Drained::Failed(tag),
+         }
+      }
+   }
+}
+
+/// Runs the response hooks on the whole `body` and puts their status and body
+/// in `result`, whose body is empty.
+fn deliver(result: &mut LocatedResult<'_>, in_flight: InFlight, body: Vec<u8>) {
+   let (status, body) = run_response_hooks(in_flight, i32::from(*result.status), body);
+   if let Ok(status) = u16::try_from(status) {
+      *result.status = status;
+   }
+   result.body.set(body);
+}
+
+/// Frees a host `Box<dyn Stream>` as the host would.
+///
+/// # Safety
+///
+/// `stream` is live and owned, and is not used again.
+unsafe fn free_stream(stream: RawStream, dealloc: HostDeallocFn) {
+   // SAFETY: the box's vtable is the host's.
+   let vtable = unsafe { &*stream.vtable };
+   if let Some(drop) = vtable.drop {
+      // SAFETY: drops the boxed value in place.
+      unsafe { drop(stream.data) };
+   }
+   if vtable.size != 0 {
+      // SAFETY: the host allocated the box with its own allocator.
+      unsafe { dealloc(stream.data.cast(), vtable.size, vtable.align) };
+   }
+}
+
+/// # Safety
+///
+/// `bytes` is a live `Bytes` that is not used again.
+unsafe fn drop_bytes(bytes: &RawBytes) {
+   if bytes.vtable.is_null() {
+      return;
+   }
+   // SAFETY: drops `bytes` through its own vtable.
+   unsafe {
+      ((*bytes.vtable).drop)(
+         bytes.data.load(Ordering::Relaxed).cast(),
+         bytes.ptr,
+         bytes.len,
+      );
+   };
+}
+
+/// Frees a drain the future leaves behind, so its address can be reused, then
+/// drops the future. The drained result's other fields leak, since their drop
+/// glue is the host's.
+unsafe extern "C" fn drop_detour(future: *mut c_void) {
+   let installed = INSTALLED
+      .get()
+      .expect("drop_detour only runs after INSTALLED is set");
+   let Responses::Located(located) = installed.responses else {
+      unreachable!("drop is only hooked for located responses");
+   };
+   if panic::catch_unwind(AssertUnwindSafe(|| {
+      if let Some(drain) = unstash(future.addr()) {
+         // SAFETY: the drain owned the stream, and is gone.
+         unsafe { free_stream(drain.stream, located.dealloc) };
+      }
+      drop(take_response(future.addr() as u64));
+   }))
+   .is_err()
+   {
+      log::error!("discord desktop: drop_detour panicked");
+   }
+   // SAFETY: forwards to the future's own drop.
+   unsafe { (located.drop)(future) };
+}
 /// Replaces `vec`'s contents with `new_body` while staying 100% compatible
 /// with `Discord.exe`'s custom `#[global_allocator]`.
 ///
@@ -817,6 +1285,142 @@ mod tests {
       assert_eq!(STANDARD_HEADERS[46], "location");
       assert_eq!(STANDARD_HEADERS[70], "user-agent");
       assert_eq!(STANDARD_HEADERS[80], "x-xss-protection");
+   }
+
+   const fn no_bytes() -> RawBytes {
+      RawBytes {
+         vtable: ptr::null(),
+         ptr:    ptr::null(),
+         len:    0,
+         data:   AtomicPtr::new(ptr::null_mut()),
+      }
+   }
+
+   /// A stream that waits once, then yields "ab" and "cd" and ends.
+   struct Chunks {
+      polls:   usize,
+      dropped: bool,
+   }
+
+   unsafe extern "C" fn chunks_poll_next(
+      out: *mut RawChunk,
+      data: *mut c_void,
+      _cx: *mut c_void,
+   ) -> *mut RawChunk {
+      // SAFETY: the test hands its own `Chunks`.
+      let chunks = unsafe { &mut *data.cast::<Chunks>() };
+      chunks.polls += 1;
+      let chunk = match chunks.polls {
+         1 => {
+            RawChunk {
+               tag:   RawChunk::PENDING,
+               bytes: no_bytes(),
+            }
+         },
+         2 => {
+            RawChunk {
+               tag:   RawChunk::OK,
+               bytes: make_owned_bytes(b"ab".to_vec()),
+            }
+         },
+         3 => {
+            RawChunk {
+               tag:   RawChunk::OK,
+               bytes: make_owned_bytes(b"cd".to_vec()),
+            }
+         },
+         _ => {
+            RawChunk {
+               tag:   RawChunk::END,
+               bytes: no_bytes(),
+            }
+         },
+      };
+      // SAFETY: `out` is the caller's chunk.
+      unsafe { out.write(chunk) };
+      out
+   }
+
+   unsafe extern "C" fn chunks_drop(data: *mut c_void) {
+      // SAFETY: as above.
+      unsafe { (*data.cast::<Chunks>()).dropped = true };
+   }
+
+   static FREED: AtomicUsize = AtomicUsize::new(0);
+
+   unsafe extern "C" fn record_dealloc(_ptr: *mut u8, size: usize, _align: usize) {
+      FREED.store(size, Ordering::Relaxed);
+   }
+
+   unsafe extern "C" fn no_drop(_future: *mut c_void) {}
+
+   static CHUNKS_VTABLE: RawStreamVtable = RawStreamVtable {
+      drop:      Some(chunks_drop),
+      size:      size_of::<Chunks>(),
+      align:     align_of::<Chunks>(),
+      poll_next: chunks_poll_next,
+   };
+
+   #[test]
+   fn drains_a_streamed_body_across_polls() {
+      let layout = http::ResultLayout {
+         size:    0x1C8,
+         pending: u64::MAX,
+         err:     2,
+         status:  0x1C0,
+         body:    0x178,
+      };
+      let located = Located {
+         layout,
+         drop: no_drop,
+         dealloc: record_dealloc,
+      };
+      let mut chunks = Chunks {
+         polls:   0,
+         dropped: false,
+      };
+      let mut out = vec![0_u64; layout.size / 8];
+      out[layout.body / 8] = RawResponseBody::STREAM;
+      out[layout.body / 8 + 1] = (&raw mut chunks).addr() as u64;
+      out[layout.body / 8 + 2] = (&raw const CHUNKS_VTABLE).addr() as u64;
+      out[layout.status / 8] = 404;
+      let out = out.as_mut_ptr().cast::<c_void>();
+      let future = 0x5EED_0000_usize as *mut c_void;
+
+      phoenix_runtime::discord::add_response_hook(
+         u64::MAX,
+         "test".to_owned(),
+         phoenix_runtime::discord::RequestFilter {
+            path_suffix: Some("/sunbird-drain-test".to_owned()),
+            ..Default::default()
+         },
+      );
+      let in_flight = watch_response("GET", "https://discord.com/api/v9/sunbird-drain-test")
+         .expect("the test hook matches");
+      track_response(future.addr() as u64, in_flight);
+
+      // SAFETY: `out` is a located result whose body streams `chunks`.
+      unsafe { respond(out, future, ptr::null_mut(), located) };
+      // SAFETY: `out` is the test's.
+      assert_eq!(unsafe { out.cast::<u64>().read() }, layout.pending);
+      let drain = unstash(future.addr()).expect("a waiting stream is kept");
+      // SAFETY: as above, on the future's next poll.
+      unsafe { drain.resume(out, future.addr(), ptr::null_mut(), located) };
+      phoenix_runtime::discord::remove_response_hook(u64::MAX);
+
+      assert!(unstash(future.addr()).is_none());
+      assert!(chunks.dropped);
+      assert_eq!(FREED.load(Ordering::Relaxed), size_of::<Chunks>());
+      // SAFETY: `out` holds the finished result.
+      let result = unsafe { LocatedResult::at(out, layout) };
+      assert_eq!(*result.status, 404);
+      assert!(matches!(result.body.kind(), Body::Full));
+      // SAFETY: a full body holds our `Bytes`.
+      let bytes = unsafe { result.body.bytes() };
+      // SAFETY: as above.
+      assert_eq!(unsafe { read_bytes(bytes) }, b"abcd");
+      // SAFETY: as above.
+      unsafe { drop_bytes(bytes) };
    }
 
    #[test]
